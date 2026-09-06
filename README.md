@@ -7,7 +7,7 @@ GoFast 框架的 [GORM](https://gorm.io) 数据库驱动插件。
 ## 安装
 
 ```bash
-go get github.com/zhoudm1743/gofast-gorm@v0.8.2
+go get github.com/zhoudm1743/gofast-gorm@latest
 ```
 
 ## 接入
