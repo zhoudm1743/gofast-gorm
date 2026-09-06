@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
@@ -24,6 +25,11 @@ type GormDriver struct {
 	db            *gorm.DB
 	schema        string // PostgreSQL schema（用于 AutoMigrate 时显式 SET search_path）
 	cachesEnabled bool   // 查询缓存插件是否已启用（避免重复注册）
+
+	// ── 统一 orm tag 体系（schema patch，文档 7.1/7.4）──
+	patched       sync.Map   // reflect.Type → struct{}：已 patch 模型类型
+	patchMu       sync.Mutex // patch 双重检查锁
+	versionFields sync.Map   // reflect.Type → *versionFieldMeta：乐观锁字段注册表
 }
 
 var _ contracts.Driver = (*GormDriver)(nil)
@@ -127,7 +133,7 @@ func (d *GormDriver) Query(ctx ...context.Context) contracts.Query {
 	if len(ctx) > 0 && ctx[0] != nil {
 		db = db.WithContext(ctx[0])
 	}
-	return &GormQuery{db: db}
+	return &GormQuery{db: db, driver: d}
 }
 
 func (d *GormDriver) DriverName() string { return "gormdriver" }
@@ -151,6 +157,14 @@ func (d *GormDriver) Close() error {
 }
 
 func (d *GormDriver) AutoMigrate(models ...any) error {
+	// patch 触发时机（7.2）：AutoMigrate 前对全部 models 先 ensurePatched，
+	// 保证 DDL 使用 orm tag patch 后的元数据；orm tag 禁用 token/未知裸 token
+	// 在此启动期即报错（4.4）
+	for _, model := range models {
+		if err := d.ensurePatched(model, d.db); err != nil {
+			return err
+		}
+	}
 	if d.schema == "" {
 		return d.db.AutoMigrate(models...)
 	}

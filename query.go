@@ -3,10 +3,12 @@ package gormdriver
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
+	"github.com/zhoudm1743/go-fast-framework/database/preload"
 	"github.com/zhoudm1743/go-fast-framework/utils"
 
 	"gorm.io/gorm"
@@ -19,13 +21,27 @@ import (
 type GormQuery struct {
 	db     *gorm.DB
 	schema string // 动态 schema 前缀，主要用于 PostgreSQL 多 schema 场景
+	driver *GormDriver
+
+	// enginePreloads 共享 Preload 引擎待执行项（9.3 分流：gorm:"-" 关联字段
+	// 由共享引擎接管；gorm 原生 Preload 无法回填被忽略的关联字段，故延迟到
+	// 终结方法行装载完成后执行）。
+	enginePreloads []enginePreloadSpec
+}
+
+// enginePreloadSpec 单个共享引擎 Preload 的定制项。
+type enginePreloadSpec struct {
+	path      string
+	conds     []any
+	callbacks []func(contracts.Query) contracts.Query
 }
 
 var _ contracts.Query = (*GormQuery)(nil)
 
-// wrap 创建新的 GormQuery，传入新的 *gorm.DB，并保留当前 schema。
+// wrap 创建新的 GormQuery，传入新的 *gorm.DB，并保留当前 schema、driver 与
+// 待执行的引擎 Preload 列表。
 func (q *GormQuery) wrap(db *gorm.DB) *GormQuery {
-	return &GormQuery{db: db, schema: q.schema}
+	return &GormQuery{db: db, schema: q.schema, driver: q.driver, enginePreloads: q.enginePreloads}
 }
 
 // schemaTable 在 schema 非空且 name 中不含 "." 时自动加上 "schema." 前缀。
@@ -61,7 +77,11 @@ func (q *GormQuery) Schema(name string) contracts.Query {
 		clone.TablePrefix = name + "."
 		db.NamingStrategy = &clone
 	}
-	return &GormQuery{db: db, schema: name}
+	// 保留 driver 与 enginePreloads（与 wrap 同语义）：Schema() 后的链仍需
+	// driver 做 orm tag 懒加载 patch（applySchema → ensurePatched）与共享
+	// Preload 引擎回填；丢失会导致 Schema 链上的写操作按未 patch 的约定
+	// 列名拼 SQL（U18 集成测试回归发现）。
+	return &GormQuery{db: db, schema: name, driver: q.driver, enginePreloads: q.enginePreloads}
 }
 
 // GetSchema 返回当前查询上下文的 schema 名称（PostgreSQL 多 schema 场景）。
@@ -100,31 +120,77 @@ func (q *GormQuery) withoutCache() *GormQuery {
 	return q
 }
 
-// applySchema 在终结方法（First/Find/Create 等）执行前处理租户 schema。
+// ensurePatched 懒加载兜底：终结方法执行前保证 dest/value 所在模型已按 orm
+// tag patch（懒加载兜底，文档 7.2）。错误向上透出。
+// 传链上 q.db 作为首次解析连接：动态 Schema() 链的租户前缀 NS 决定 gorm
+// schema 缓存钉住的表名（见 ensurePatched 注释）。
+func (q *GormQuery) ensurePatched(value any) error {
+	if q.driver == nil || value == nil {
+		return nil
+	}
+	return q.driver.ensurePatched(value, q.db)
+}
+
+// ensurePatchedWrite 写路径盲区补齐：Update/Updates 系方法头部对 values 与
+// 链上 Model 所在模型 ensurePatched（乐观锁与 patch 正确性必需）。
+func (q *GormQuery) ensurePatchedWrite(values any) error {
+	if q.driver == nil {
+		return nil
+	}
+	if values != nil {
+		if err := q.driver.ensurePatched(values, q.db); err != nil {
+			return err
+		}
+	}
+	if m := q.db.Statement.Model; m != nil {
+		return q.driver.ensurePatched(m, q.db)
+	}
+	return nil
+}
+
+// ensurePatchedChainModel 对链上 Model（无 dest 的聚合/单列路径）ensurePatched。
+func (q *GormQuery) ensurePatchedChainModel() error {
+	if q.driver == nil {
+		return nil
+	}
+	if m := q.db.Statement.Model; m != nil {
+		return q.driver.ensurePatched(m, q.db)
+	}
+	if d := q.db.Statement.Dest; d != nil {
+		return q.driver.ensurePatched(d, q.db)
+	}
+	return nil
+}
+
+// applySchema 在终结方法（First/Find/Create 等）执行前处理租户 schema，
+// 并对 dest 执行 orm tag schema patch（懒加载兜底，文档 7.2）。
 // 多租户 schema 已通过 Schema() 动态设置 NamingStrategy.TablePrefix，主表与关联表
 // （Preload/Joins）由 GORM 统一生成租户 schema 前缀，此处仅保留兜底逻辑：
 // 若 NamingStrategy 未生效（如模型实现 TableName() 或自定义 Namer）——解析 dest 得到
 // 无 schema 前缀的裸表名——且调用方未显式指定表名，则显式加上 schema 前缀。
 // 注意：不再使用 SET search_path，因为该语句作用于连接 session，会污染连接池
 // （被其他租户复用连接时串 schema），且 SET 与后续查询可能落在不同连接上不可靠。
-func (q *GormQuery) applySchema(dest any) *gorm.DB {
+func (q *GormQuery) applySchema(dest any) (*gorm.DB, error) {
+	if err := q.ensurePatched(dest); err != nil {
+		return nil, err
+	}
 	if q.schema == "" || dest == nil {
-		return q.db
+		return q.db, nil
 	}
 	// 调用方已显式 Table()/Model()（schema 模式下驱动已拼好前缀）：
 	// 尊重显式表名，不得按 dest 推导覆盖，否则投影结构体、分表等
 	// dest 推导表名与实际表名不一致的场景会静默查错表。
 	if q.db.Statement.Table != "" || q.db.Statement.TableExpr != nil {
-		return q.db
+		return q.db, nil
 	}
 	stmt := &gorm.Statement{DB: q.db}
 	// Statement.Parse 会把带 "schema." 前缀的表名拆分：前缀留在 TableExpr、
 	// Table 裁成裸名，故用 TableExpr == nil 判定 NamingStrategy 未生效（无前缀），
 	// 而非判断 Table 是否含 "."（前缀生效时 Table 恒为裸名，该判定永真）。
 	if err := stmt.Parse(dest); err == nil && stmt.Table != "" && stmt.TableExpr == nil && !strings.Contains(stmt.Table, ".") {
-		return q.db.Table(q.schema + "." + stmt.Table)
+		return q.db.Table(q.schema + "." + stmt.Table), nil
 	}
-	return q.db
+	return q.db, nil
 }
 
 // ── 构建条件 ─────────────────────────────────────────────────────────
@@ -203,7 +269,54 @@ func (q *GormQuery) Joins(query string, args ...any) contracts.Query {
 	return q.wrap(q.db.Joins(query, args...))
 }
 
+// useEnginePreload 判定 Preload 首段字段是否走共享 Preload 引擎（9.3 分流）：
+// 字段 gorm tag 为 "-"（gorm 关联解析被跳过，rel tag 元数据由共享引擎接管）→ true；
+// 有 gorm 关联 tag 或无任何 tag（约定外键）→ false（gorm 原生 Preload）。
+// 嵌套路径仅按首段判定，后续段由引擎自行解析 rel/约定。
+func (q *GormQuery) useEnginePreload(path string) bool {
+	if q.driver == nil {
+		return false
+	}
+	model := q.db.Statement.Model
+	if model == nil {
+		model = q.db.Statement.Dest
+	}
+	if model == nil {
+		return false
+	}
+	t := indirectStructType(model)
+	if t == nil {
+		return false
+	}
+	seg := path
+	if idx := strings.IndexByte(seg, '.'); idx >= 0 {
+		seg = seg[:idx]
+	}
+	if sf, ok := t.FieldByName(seg); ok && strings.TrimSpace(sf.Tag.Get("gorm")) == "-" {
+		return true
+	}
+	return false
+}
+
+// Preload 关联预加载（9.3 分流）：
+//  1. 字段有 gorm 关联 tag（foreignKey/many2many/polymorphic 等）→ gorm 原生 Preload；
+//  2. 字段有 gorm:"-" → 共享 Preload 引擎（rel tag 元数据，含 many2many/polymorphic），
+//     回填在终结方法行装载完成后执行；
+//  3. 字段无任何 tag → gorm 原生 Preload（约定外键）。
 func (q *GormQuery) Preload(query string, args ...any) contracts.Query {
+	if q.useEnginePreload(query) {
+		spec := enginePreloadSpec{path: query}
+		for _, a := range args {
+			if cb, ok := a.(func(contracts.Query) contracts.Query); ok {
+				spec.callbacks = append(spec.callbacks, cb)
+			} else {
+				spec.conds = append(spec.conds, a)
+			}
+		}
+		next := q.wrap(q.db)
+		next.enginePreloads = append(append([]enginePreloadSpec{}, q.enginePreloads...), spec)
+		return next
+	}
 	if q.schema != "" {
 		schema := q.schema
 		// Preload 生成的子查询不会继承 Tenant() 设置的 schema，
@@ -246,31 +359,87 @@ func (q *GormQuery) Preload(query string, args ...any) contracts.Query {
 	return q.wrap(q.db.Preload(query, args...))
 }
 
+// runEnginePreloads 终结方法行装载完成后执行共享 Preload 引擎回填（9.3）。
+// 子查询由 NewQuery 闭包创建：从当前 q.db 构造全新会话（继承 schema 前缀、
+// ctx 与缓存标记，不继承父链条件）；表名/列名经 gormMetaAdapter 以命名策略
+// 解析后的最终名提供。
+func (q *GormQuery) runEnginePreloads(dest any) error {
+	if len(q.enginePreloads) == 0 || dest == nil || q.driver == nil {
+		return nil
+	}
+	meta := &gormMetaAdapter{driver: q.driver, db: q.db}
+	engine := &preload.Engine{
+		Meta: meta,
+		NewQuery: func() contracts.Query {
+			return &GormQuery{
+				db:     q.db.Session(&gorm.Session{NewDB: true}),
+				schema: q.schema,
+				driver: q.driver,
+			}
+		},
+		Resolver: &preload.ORMTagResolver{Meta: meta},
+	}
+	for _, spec := range q.enginePreloads {
+		if err := engine.Preload(dest, spec.path, spec.conds, spec.callbacks); err != nil {
+			return wrapError(err)
+		}
+	}
+	return nil
+}
+
 // ── 终结方法 ─────────────────────────────────────────────────────────
 
 func (q *GormQuery) Find(dest any, conds ...any) error {
-	if err := wrapError(q.applySchema(dest).Find(dest, conds...).Error); err != nil {
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.Find(dest, conds...).Error); err != nil {
+		return err
+	}
+	if err := q.runEnginePreloads(dest); err != nil {
 		return err
 	}
 	return invokeAfterFind(q, dest)
 }
 
 func (q *GormQuery) First(dest any, conds ...any) error {
-	if err := wrapError(q.applySchema(dest).First(dest, conds...).Error); err != nil {
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.First(dest, conds...).Error); err != nil {
+		return err
+	}
+	if err := q.runEnginePreloads(dest); err != nil {
 		return err
 	}
 	return invokeAfterFind(q, dest)
 }
 
 func (q *GormQuery) Last(dest any, conds ...any) error {
-	if err := wrapError(q.applySchema(dest).Last(dest, conds...).Error); err != nil {
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.Last(dest, conds...).Error); err != nil {
+		return err
+	}
+	if err := q.runEnginePreloads(dest); err != nil {
 		return err
 	}
 	return invokeAfterFind(q, dest)
 }
 
 func (q *GormQuery) Take(dest any, conds ...any) error {
-	if err := wrapError(q.applySchema(dest).Take(dest, conds...).Error); err != nil {
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.Take(dest, conds...).Error); err != nil {
+		return err
+	}
+	if err := q.runEnginePreloads(dest); err != nil {
 		return err
 	}
 	return invokeAfterFind(q, dest)
@@ -280,7 +449,17 @@ func (q *GormQuery) Create(value any) error {
 	if err := invokeBeforeCreate(q, value); err != nil {
 		return err
 	}
-	if err := wrapError(q.applySchema(value).Create(value).Error); err != nil {
+	if err := q.ensurePatched(value); err != nil {
+		return err
+	}
+	if q.driver != nil {
+		q.driver.setVersionOnCreate(value) // 乐观锁：插入 version 置 1（7.4）
+	}
+	db, err := q.applySchema(value)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.Create(value).Error); err != nil {
 		return err
 	}
 	return invokeAfterCreate(q, value)
@@ -290,7 +469,17 @@ func (q *GormQuery) CreateInBatches(value any, batchSize int) error {
 	if err := invokeBeforeCreate(q, value); err != nil {
 		return err
 	}
-	if err := wrapError(q.applySchema(value).CreateInBatches(value, batchSize).Error); err != nil {
+	if err := q.ensurePatched(value); err != nil {
+		return err
+	}
+	if q.driver != nil {
+		q.driver.setVersionOnCreate(value) // 乐观锁：插入 version 置 1（7.4）
+	}
+	db, err := q.applySchema(value)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.CreateInBatches(value, batchSize).Error); err != nil {
 		return err
 	}
 	return invokeAfterCreate(q, value)
@@ -300,7 +489,19 @@ func (q *GormQuery) Save(value any) error {
 	if err := invokeBeforeUpdate(q, value); err != nil {
 		return err
 	}
-	if err := wrapError(q.applySchema(value).Save(value).Error); err != nil {
+	if err := q.ensurePatched(value); err != nil {
+		return err
+	}
+	db, err := q.applySchema(value)
+	if err != nil {
+		return err
+	}
+	if q.driver != nil {
+		// 乐观锁仿真（7.4）：无 version 字段时内部走原生 Save（含 upsert 回落）
+		if _, err := q.driver.saveWithLock(db, value); err != nil {
+			return err
+		}
+	} else if err := wrapError(db.Save(value).Error); err != nil {
 		return err
 	}
 	return invokeAfterUpdate(q, value)
@@ -343,11 +544,25 @@ func convertUpdateValues(values any) any {
 }
 
 func (q *GormQuery) Update(column string, value any) error {
+	// 盲区补齐：Update 单列不经 applySchema，链上模型需懒加载 patch。
+	// Update 单列不参与乐观锁（7.4，对齐 xorm 指定列更新无版本条件）。
+	if err := q.ensurePatchedChainModel(); err != nil {
+		return err
+	}
 	// 值为 SQL 表达式（contracts.Expr）时转换为 gorm.Expr，实现数据库端原子更新（X-08）。
 	return wrapError(q.db.Update(column, toGormValue(value)).Error)
 }
 
 func (q *GormQuery) Updates(values any) error {
+	if err := q.ensurePatchedWrite(values); err != nil {
+		return err
+	}
+	if q.driver != nil && q.driver.hasVersionLock(values) {
+		// 乐观锁仿真（7.4）：struct 更新 WHERE version=旧值 + 自增 + 回填
+		if _, handled := q.driver.updatesWithLock(q.db, values); handled {
+			return nil
+		}
+	}
 	return wrapError(q.db.Updates(convertUpdateValues(values)).Error)
 }
 
@@ -355,21 +570,34 @@ func (q *GormQuery) Delete(value any, conds ...any) error {
 	if err := invokeBeforeDelete(q, value); err != nil {
 		return err
 	}
-	if err := wrapError(q.applySchema(value).Delete(value, conds...).Error); err != nil {
+	db, err := q.applySchema(value)
+	if err != nil {
+		return err
+	}
+	if err := wrapError(db.Delete(value, conds...).Error); err != nil {
 		return err
 	}
 	return invokeAfterDelete(q, value)
 }
 
 func (q *GormQuery) Count(count *int64) error {
+	if err := q.ensurePatchedChainModel(); err != nil {
+		return err
+	}
 	return wrapError(q.db.Count(count).Error)
 }
 
 func (q *GormQuery) Scan(dest any) error {
+	if err := q.ensurePatched(dest); err != nil {
+		return err
+	}
 	return wrapError(q.db.Scan(dest).Error)
 }
 
 func (q *GormQuery) Pluck(column string, dest any) error {
+	if err := q.ensurePatchedChainModel(); err != nil {
+		return err
+	}
 	return wrapError(q.db.Pluck(column, dest).Error)
 }
 
@@ -391,7 +619,17 @@ func (q *GormQuery) CreateResult(value any) contracts.Result {
 	if err := invokeBeforeCreate(q, value); err != nil {
 		return contracts.Result{Error: err}
 	}
-	tx := q.applySchema(value).Create(value)
+	if err := q.ensurePatched(value); err != nil {
+		return contracts.Result{Error: err}
+	}
+	if q.driver != nil {
+		q.driver.setVersionOnCreate(value) // 乐观锁：插入 version 置 1（7.4）
+	}
+	db, err := q.applySchema(value)
+	if err != nil {
+		return contracts.Result{Error: err}
+	}
+	tx := db.Create(value)
 	if tx.Error != nil {
 		return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
 	}
@@ -402,11 +640,24 @@ func (q *GormQuery) CreateResult(value any) contracts.Result {
 }
 
 func (q *GormQuery) UpdateResult(column string, value any) contracts.Result {
+	// 盲区补齐：UpdateResult 单列不经 applySchema；不参与乐观锁（7.4）。
+	if err := q.ensurePatchedChainModel(); err != nil {
+		return contracts.Result{Error: err}
+	}
 	tx := q.db.Update(column, toGormValue(value))
 	return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
 }
 
 func (q *GormQuery) UpdatesResult(values any) contracts.Result {
+	if err := q.ensurePatchedWrite(values); err != nil {
+		return contracts.Result{Error: err}
+	}
+	if q.driver != nil && q.driver.hasVersionLock(values) {
+		// 乐观锁仿真（7.4）：struct 更新 WHERE version=旧值 + 自增 + 回填
+		if tx, handled := q.driver.updatesWithLock(q.db, values); handled {
+			return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
+		}
+	}
 	tx := q.db.Updates(convertUpdateValues(values))
 	return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
 }
@@ -415,7 +666,11 @@ func (q *GormQuery) DeleteResult(value any, conds ...any) contracts.Result {
 	if err := invokeBeforeDelete(q, value); err != nil {
 		return contracts.Result{Error: err}
 	}
-	tx := q.applySchema(value).Delete(value, conds...)
+	db, err := q.applySchema(value)
+	if err != nil {
+		return contracts.Result{Error: err}
+	}
+	tx := db.Delete(value, conds...)
 	if tx.Error != nil {
 		return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
 	}
@@ -429,7 +684,25 @@ func (q *GormQuery) SaveResult(value any) contracts.Result {
 	if err := invokeBeforeUpdate(q, value); err != nil {
 		return contracts.Result{Error: err}
 	}
-	tx := q.applySchema(value).Save(value)
+	if err := q.ensurePatched(value); err != nil {
+		return contracts.Result{Error: err}
+	}
+	db, err := q.applySchema(value)
+	if err != nil {
+		return contracts.Result{Error: err}
+	}
+	if q.driver != nil {
+		// 乐观锁仿真（7.4）：无 version 字段时内部走原生 Save（含 upsert 回落）
+		rows, err := q.driver.saveWithLock(db, value)
+		if err != nil {
+			return contracts.Result{RowsAffected: rows, Error: err}
+		}
+		if err := invokeAfterUpdate(q, value); err != nil {
+			return contracts.Result{Error: err}
+		}
+		return contracts.Result{RowsAffected: rows}
+	}
+	tx := db.Save(value)
 	if tx.Error != nil {
 		return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
 	}
@@ -570,16 +843,39 @@ func (q *GormQuery) ForceDelete(value any, conds ...any) error {
 // ── 高级查询 ─────────────────────────────────────────────────────────
 
 func (q *GormQuery) FirstOrCreate(dest any, conds ...any) error {
-	return wrapError(q.applySchema(dest).FirstOrCreate(dest, conds...).Error)
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	return wrapError(db.FirstOrCreate(dest, conds...).Error)
 }
 
 func (q *GormQuery) FirstOrInit(dest any, conds ...any) error {
-	return wrapError(q.applySchema(dest).FirstOrInit(dest, conds...).Error)
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	return wrapError(db.FirstOrInit(dest, conds...).Error)
 }
 
 func (q *GormQuery) FindInBatches(dest any, batchSize int, fc func(tx contracts.Query, batch int) error) error {
-	return wrapError(q.applySchema(dest).FindInBatches(dest, batchSize, func(tx *gorm.DB, batch int) error {
-		return fc(q.wrap(tx), batch)
+	// 非法 batchSize 防护：gorm 内部对非正 batchSize 会以 reflect 切片越界 panic
+	//（§11.6"非法 batchSize 不 panic"），此处提前拦截返回明确错误（xorm 侧同
+	// 参数不 panic，行为差异已在套件注释固化）。
+	if batchSize <= 0 {
+		return fmt.Errorf("%w: FindInBatches batchSize 必须为正整数，收到 %d", contracts.ErrUnsupported, batchSize)
+	}
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return err
+	}
+	return wrapError(db.FindInBatches(dest, batchSize, func(tx *gorm.DB, batch int) error {
+		gq := q.wrap(tx)
+		// 共享引擎 Preload 逐批回填（与 gorm 原生批内 Preload 时机一致）
+		if err := gq.runEnginePreloads(dest); err != nil {
+			return err
+		}
+		return fc(gq, batch)
 	}).Error)
 }
 
@@ -622,11 +918,15 @@ func (q *GormQuery) ScanMap(dest *[]map[string]any) error {
 }
 
 func (q *GormQuery) Exists(dest any, conds ...any) (bool, error) {
-	var count int64
-	tx := q.applySchema(dest).Model(dest)
+	db, err := q.applySchema(dest)
+	if err != nil {
+		return false, err
+	}
+	tx := db.Model(dest)
 	if len(conds) > 0 {
 		tx = tx.Where(conds[0], conds[1:]...)
 	}
+	var count int64
 	if err := tx.Limit(1).Count(&count).Error; err != nil {
 		return false, wrapError(err)
 	}

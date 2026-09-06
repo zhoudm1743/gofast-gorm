@@ -1,6 +1,7 @@
 package gormdriver
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,6 +22,11 @@ func wrapError(err error) error {
 	case isErr(err, gorm.ErrDuplicatedKey):
 		return fmt.Errorf("%w: %v", contracts.ErrDuplicatedKey, err)
 	case isErr(err, gorm.ErrInvalidTransaction):
+		return fmt.Errorf("%w: %v", contracts.ErrInvalidTransaction, err)
+	// 事务终态后继续 Commit/Rollback：gorm 原样透出 database/sql 的
+	// ErrTxDone（gofast.ErrInvalidTransaction 仅在 gorm 内部事务状态机命中），
+	// 按 xorm 驱动同一语义映射为 ErrInvalidTransaction（§11.14 错误映射行）。
+	case errors.Is(err, sql.ErrTxDone):
 		return fmt.Errorf("%w: %v", contracts.ErrInvalidTransaction, err)
 	default:
 		msg := err.Error()

@@ -5,7 +5,7 @@ go 1.25.5
 require (
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-gorm/caches/v4 v4.0.5
-	github.com/zhoudm1743/go-fast-framework v0.8.2
+	github.com/zhoudm1743/go-fast-framework v1.0.0
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/driver/sqlserver v1.6.3
