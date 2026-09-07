@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts/ormtag"
 	"github.com/zhoudm1743/go-fast-framework/database/preload"
@@ -62,7 +63,44 @@ func (d *GormDriver) ensurePatched(model any, db *gorm.DB) error {
 	if _, ok := d.patched.Load(t); ok {
 		return nil
 	}
+	return patchModel(db, t, &d.versionFields)
+}
 
+// PatchSchema 将 models 的 orm/ext 统一标签 patch 进 db 连接的 gorm schema 缓存（7.1），
+// 供自带迁移/DDL 工具链的业务在自定义 gorm 连接上复用统一标签事实源（典型用法：
+// 自建连接先 PatchSchema(db, models...) 再 db.AutoMigrate(models...)，DDL 即由 orm 标签驱动）。
+//
+// db 语义与 ensurePatched 一致：gorm schema 缓存以类型为键、首次解析钉住 NamingStrategy
+// 表名前缀，Parse 与后续 AutoMigrate 必须使用同一条连接。
+// 幂等性以「每函数调用」为界（索引双写片段不可重复注入）：同一连接请合并 models
+// 一次性传入；每连接一次 PatchSchema 的迁移场景天然满足。
+func PatchSchema(db *gorm.DB, models ...any) error {
+	if db == nil {
+		return nil
+	}
+	var memo sync.Map // reflect.Type → struct{}{}（本调用内去重）
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		t := indirectStructType(model)
+		if t == nil {
+			continue // 非 struct（map/标量投影等）无需 patch
+		}
+		if _, ok := memo.LoadOrStore(t, struct{}{}); ok {
+			continue
+		}
+		if err := patchModel(db, t, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// patchModel 对单个模型类型执行 stmt.Parse + orm/ext patch（无去重，调用方负责幂等）。
+// versionRegistry 为 orm:"version" 乐观锁字段注册表（7.4 写路径仿真用）；nil 时跳过
+// 登记（PatchSchema 迁移场景无写路径，无需注册）。
+func patchModel(db *gorm.DB, t reflect.Type, versionRegistry *sync.Map) error {
 	normalized := reflect.New(t).Interface()
 	stmt := &gorm.Statement{DB: db}
 	if err := stmt.Parse(normalized); err != nil {
@@ -76,17 +114,16 @@ func (d *GormDriver) ensurePatched(model any, db *gorm.DB) error {
 	}
 	// orm patch（返回索引双写片段），随后 ext patch 可覆盖同维度片段，
 	// 最后统一收口注入 Field.Tag（4.6 优先级：ext > orm）
-	indexSpecs, err := d.applyFieldMeta(stmt.Schema, meta)
+	indexSpecs, err := applyFieldMeta(db, stmt.Schema, meta, versionRegistry)
 	if err != nil {
 		return err
 	}
-	d.applyExtMeta(stmt.Schema, meta, indexSpecs)
+	applyExtMeta(db, stmt.Schema, meta, indexSpecs)
 	for gf, fragments := range indexSpecs {
 		for _, frag := range fragments {
 			gf.Tag = injectGormTag(gf.Tag, frag.fragment)
 		}
 	}
-	d.patched.Store(t, struct{}{})
 	return nil
 }
 
@@ -103,7 +140,7 @@ func setIndexFragment(specs map[*gormSchema.Field][]indexFragment, gf *gormSchem
 	specs[gf] = append(specs[gf], frag)
 }
 
-func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta) (map[*gormSchema.Field][]indexFragment, error) {
+func applyFieldMeta(db *gorm.DB, s *gormSchema.Schema, meta *ormtag.ModelMeta, versionRegistry *sync.Map) (map[*gormSchema.Field][]indexFragment, error) {
 	ignored := make(map[*gormSchema.Field]bool)
 	ormPKFields := make(map[string]bool)
 	anyPK := false
@@ -119,7 +156,7 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 		}
 		gf := locateGormField(s, byIndex, fm)
 		if gf == nil {
-			d.warnf("[gormdriver] 模型 %s 的 orm tag 字段 %q 未能在 gorm schema 中定位，已跳过 patch", s.Name, fm.FieldName)
+			warnf(db, "[gormdriver] 模型 %s 的 orm tag 字段 %q 未能在 gorm schema 中定位，已跳过 patch", s.Name, fm.FieldName)
 			continue
 		}
 
@@ -147,13 +184,13 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 		}
 		// 列名：改 DBName，索引 map 由 rebuildFieldMaps 重建
 		if fm.ColumnName != "" && gf.DBName != fm.ColumnName {
-			d.warnGormConflict(gf, "column", fm.ColumnName, "COLUMN")
+			warnGormConflict(db, gf, "column", fm.ColumnName, "COLUMN")
 			gf.DBName = fm.ColumnName
 		}
 		// 类型 token：泛型映射写 Size/Precision/Scale，DataType 原文透传（含 unsigned）
 		if fm.Type != "" {
 			if v, ok := gf.TagSettings["TYPE"]; ok && v != "" {
-				d.warnGormConflict(gf, "type", fm.Type, "TYPE")
+				warnGormConflict(db, gf, "type", fm.Type, "TYPE")
 			}
 			applyTypeToken(gf, fm)
 		}
@@ -192,7 +229,7 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 		// default：DefaultValue + HasDefaultValue + DefaultValueInterface
 		if fm.HasDefault {
 			if v, ok := gf.TagSettings["DEFAULT"]; ok && v != "" {
-				d.warnGormConflict(gf, "default", fm.Default, "DEFAULT")
+				warnGormConflict(db, gf, "default", fm.Default, "DEFAULT")
 			}
 			applyDefaultValue(gf, fm)
 		}
@@ -220,19 +257,19 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 			if versionField == nil {
 				versionField = gf
 			} else {
-				d.warnf("[gormdriver] 模型 %s 存在多个 orm:\"version\" 字段，仅首个 %q 生效", s.Name, versionField.Name)
+				warnf(db, "[gormdriver] 模型 %s 存在多个 orm:\"version\" 字段，仅首个 %q 生效", s.Name, versionField.Name)
 			}
 		}
 		// utc/local/collate/json：不 patch（gorm 无列级能力 / serializer 不可 patch），
 		// 日志引导（4.5）：json 推荐字段类型实现 Scanner/Valuer
 		if fm.UTC || fm.Local {
-			d.warnf("[gormdriver] 模型 %s 字段 %q 的 orm tag utc/local 在 gorm 侧不支持（时区由 DSN loc/NowFunc 全局控制），已忽略", s.Name, fm.FieldName)
+			warnf(db, "[gormdriver] 模型 %s 字段 %q 的 orm tag utc/local 在 gorm 侧不支持（时区由 DSN loc/NowFunc 全局控制），已忽略", s.Name, fm.FieldName)
 		}
 		if fm.Collate != "" {
-			d.warnf("[gormdriver] 模型 %s 字段 %q 的 orm tag collate(%s) 在 gorm 侧不支持，已忽略；必须时可用 gorm:\"type:... collate ...\" 逃生口", s.Name, fm.FieldName, fm.Collate)
+			warnf(db, "[gormdriver] 模型 %s 字段 %q 的 orm tag collate(%s) 在 gorm 侧不支持，已忽略；必须时可用 gorm:\"type:... collate ...\" 逃生口", s.Name, fm.FieldName, fm.Collate)
 		}
 		if fm.JSON {
-			d.warnf("[gormdriver] 模型 %s 字段 %q 的 orm tag json 在 gorm 侧不可 patch（serializer 在 Parse 内包装）；推荐字段类型实现 sql.Scanner/driver.Valuer，或用 gorm:\"serializer:json\" 逃生口", s.Name, fm.FieldName)
+			warnf(db, "[gormdriver] 模型 %s 字段 %q 的 orm tag json 在 gorm 侧不可 patch（serializer 在 Parse 内包装）；推荐字段类型实现 sql.Scanner/driver.Valuer，或用 gorm:\"serializer:json\" 逃生口", s.Name, fm.FieldName)
 		}
 	}
 
@@ -272,8 +309,8 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 	rebuildFieldMaps(s)
 
 	// version 注册表（rebuild 后 DBName 已为最终列名）
-	if versionField != nil {
-		d.versionFields.Store(s.ModelType, &versionFieldMeta{
+	if versionField != nil && versionRegistry != nil {
+		versionRegistry.Store(s.ModelType, &versionFieldMeta{
 			FieldName: versionField.Name,
 			Column:    versionField.DBName,
 			Index:     normalizeReflectedIndex(versionField.StructField.Index),
@@ -287,7 +324,7 @@ func (d *GormDriver) applyFieldMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta
 
 // applyExtMeta：ext tag 逐字段 patch（gorm 专属能力，文档 7.1 第二张表 / 4.3）。
 // indexSpecs 为 orm patch 产物的索引双写片段，ext index 在此覆盖 orm index 同维度。
-func (d *GormDriver) applyExtMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta, indexSpecs map[*gormSchema.Field][]indexFragment) {
+func applyExtMeta(db *gorm.DB, s *gormSchema.Schema, meta *ormtag.ModelMeta, indexSpecs map[*gormSchema.Field][]indexFragment) {
 	for name, em := range meta.Exts {
 		gf := s.FieldsByName[name]
 		if gf == nil {
@@ -327,7 +364,7 @@ func (d *GormDriver) applyExtMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta, 
 			case "nano":
 				tt = gormSchema.UnixNanosecond
 			default:
-				d.warnf("[gormdriver] 模型 %s 字段 %q 的 ext timePrecision %q 无法识别（支持 milli|nano），已忽略", s.Name, name, em.TimePrecision)
+				warnf(db, "[gormdriver] 模型 %s 字段 %q 的 ext timePrecision %q 无法识别（支持 milli|nano），已忽略", s.Name, name, em.TimePrecision)
 			}
 			if tt != 0 {
 				if gf.AutoCreateTime > 0 {
@@ -347,7 +384,7 @@ func (d *GormDriver) applyExtMeta(s *gormSchema.Schema, meta *ormtag.ModelMeta, 
 		}
 		// 未知 ext key：本驱动不识别，未来第三驱动可能消费（文档 11.16）
 		for _, k := range em.UnknownKeys {
-			d.warnf("[gormdriver] 模型 %s 字段 %q 的 ext tag 含未知 key %q，已忽略（不报错）", s.Name, name, k)
+			warnf(db, "[gormdriver] 模型 %s 字段 %q 的 ext tag 含未知 key %q，已忽略（不报错）", s.Name, name, k)
 		}
 	}
 }
@@ -627,21 +664,21 @@ func injectGormTag(tag reflect.StructTag, gormVal string) reflect.StructTag {
 // ── 日志 ─────────────────────────────────────────────────────────────
 
 // warnf 输出 Warn 日志（10.3 陷阱表：双 tag 冲突必须告警）；logger 不可用时静默。
-func (d *GormDriver) warnf(format string, args ...any) {
-	if d == nil || d.db == nil || d.db.Logger == nil {
+func warnf(db *gorm.DB, format string, args ...any) {
+	if db == nil || db.Logger == nil {
 		return
 	}
-	d.db.Logger.Warn(context.Background(), fmt.Sprintf(format, args...))
+	db.Logger.Warn(context.Background(), fmt.Sprintf(format, args...))
 }
 
 // warnGormConflict orm tag 覆盖 gorm tag 同维度声明时的冲突告警（10.3）。
-func (d *GormDriver) warnGormConflict(gf *gormSchema.Field, dim, ormVal, gormKey string) {
+func warnGormConflict(db *gorm.DB, gf *gormSchema.Field, dim, ormVal, gormKey string) {
 	if gormVal := strings.TrimSpace(gf.TagSettings[gormKey]); gormVal != "" && !strings.EqualFold(gormVal, ormVal) {
 		modelName := ""
 		if gf.Schema != nil {
 			modelName = gf.Schema.Name
 		}
-		d.warnf("[gormdriver] 字段 %s.%s 的 orm tag %s=%q 覆盖了 gorm tag 同维度声明 %s=%q（orm 优先，文档 4.6）",
+		warnf(db, "[gormdriver] 字段 %s.%s 的 orm tag %s=%q 覆盖了 gorm tag 同维度声明 %s=%q（orm 优先，文档 4.6）",
 			modelName, gf.Name, dim, ormVal, strings.ToLower(gormKey), gormVal)
 	}
 }
