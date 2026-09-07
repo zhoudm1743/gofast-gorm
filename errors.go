@@ -1,6 +1,7 @@
 package gormdriver
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -30,6 +31,18 @@ func wrapError(err error) error {
 		return fmt.Errorf("%w: %v", contracts.ErrInvalidTransaction, err)
 	default:
 		msg := err.Error()
+		// 查询超时（§5.16 ERR-05）：服务器端超时与 Go 侧 context 截止统一映射
+		// ErrQueryTimeout——
+		//   - PostgreSQL statement_timeout：SQLSTATE 57014
+		//     "canceling statement due to statement timeout"
+		//   - MySQL max_execution_time：Error 3024 "Query execution was
+		//     interrupted, maximum statement execution time exceeded"
+		//   - Go 侧 WithContext 截止：database/sql 透传 context.DeadlineExceeded
+		if strings.Contains(msg, "statement timeout") ||
+			strings.Contains(msg, "maximum statement execution time exceeded") ||
+			errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("%w: %v", contracts.ErrQueryTimeout, err)
+		}
 		// MySQL: "Error 1213: Deadlock found when trying to get lock"
 		// PostgreSQL: "deadlock detected"
 		// SQLite: "database is locked"

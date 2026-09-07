@@ -404,40 +404,37 @@ func (q *GormQuery) Find(dest any, conds ...any) error {
 }
 
 func (q *GormQuery) First(dest any, conds ...any) error {
-	db, err := q.applySchema(dest)
-	if err != nil {
-		return err
-	}
-	if err := wrapError(db.First(dest, conds...).Error); err != nil {
-		return err
-	}
-	if err := q.runEnginePreloads(dest); err != nil {
-		return err
-	}
-	return invokeAfterFind(q, dest)
+	return q.one(func(db *gorm.DB, d any) *gorm.DB { return db.First(d, conds...) }, dest)
 }
 
 func (q *GormQuery) Last(dest any, conds ...any) error {
-	db, err := q.applySchema(dest)
-	if err != nil {
-		return err
-	}
-	if err := wrapError(db.Last(dest, conds...).Error); err != nil {
-		return err
-	}
-	if err := q.runEnginePreloads(dest); err != nil {
-		return err
-	}
-	return invokeAfterFind(q, dest)
+	return q.one(func(db *gorm.DB, d any) *gorm.DB { return db.Last(d, conds...) }, dest)
 }
 
 func (q *GormQuery) Take(dest any, conds ...any) error {
+	return q.one(func(db *gorm.DB, d any) *gorm.DB { return db.Take(d, conds...) }, dest)
+}
+
+// one 单条终结查询（First/Last/Take 共用）。
+// 契约 Q-11（NoAutoCondition 口径，双驱动一致）：dest 不作查询条件。gorm 的
+// BuildQuerySQL 会给「主键非零的 struct dest」内联主键 Eq 条件，复用已填充
+// dest 再查会被静默收窄（xorm 驱动同场景不收窄）。此处以零值副本承接执行、
+// 命中后回拷屏蔽内联；错误路径不回拷，保持 gorm「未命中不覆写 dest」语义。
+func (q *GormQuery) one(finisher func(*gorm.DB, any) *gorm.DB, dest any) error {
 	db, err := q.applySchema(dest)
 	if err != nil {
 		return err
 	}
-	if err := wrapError(db.Take(dest, conds...).Error); err != nil {
+	target := dest
+	destV := reflect.ValueOf(dest)
+	if destV.Kind() == reflect.Ptr && !destV.IsNil() && destV.Elem().Kind() == reflect.Struct {
+		target = reflect.New(destV.Type().Elem()).Interface()
+	}
+	if err := wrapError(finisher(db, target).Error); err != nil {
 		return err
+	}
+	if target != dest {
+		destV.Elem().Set(reflect.ValueOf(target).Elem())
 	}
 	if err := q.runEnginePreloads(dest); err != nil {
 		return err
@@ -478,6 +475,22 @@ func (q *GormQuery) CreateInBatches(value any, batchSize int) error {
 	db, err := q.applySchema(value)
 	if err != nil {
 		return err
+	}
+	// batchSize 非正兜底为不分批整批插入（与 xorm 驱动一致）。gorm 原生对非正
+	// batch 无守卫：batch=0 报 ErrEmptySlice、负值触发 reflect.Slice 越界 panic。
+	if batchSize <= 0 {
+		rv := reflect.ValueOf(value)
+		for rv.Kind() == reflect.Ptr {
+			if rv.IsNil() {
+				break
+			}
+			rv = rv.Elem()
+		}
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+			batchSize = rv.Len()
+		} else {
+			batchSize = 1 // 非切片回落单条（gorm CreateInBatches 默认分支语义）
+		}
 	}
 	if err := wrapError(db.CreateInBatches(value, batchSize).Error); err != nil {
 		return err
@@ -778,6 +791,11 @@ func (q *GormQuery) Paginate(page, size int) contracts.Query {
 func (q *GormQuery) Scopes(funcs ...func(contracts.Query) contracts.Query) contracts.Query {
 	gormScopes := make([]func(*gorm.DB) *gorm.DB, 0, len(funcs))
 	for _, fn := range funcs {
+		if fn == nil {
+			// 契约 ADV-08：nil 作用域跳过（与 xorm 驱动一致；gorm 的 scopes
+			// 延迟到执行期，nil 会在终结时 panic）。
+			continue
+		}
 		fn := fn
 		gormScopes = append(gormScopes, func(db *gorm.DB) *gorm.DB {
 			result := fn(q.wrap(db))
@@ -786,6 +804,9 @@ func (q *GormQuery) Scopes(funcs ...func(contracts.Query) contracts.Query) contr
 			}
 			return db
 		})
+	}
+	if len(gormScopes) == 0 {
+		return q
 	}
 	return q.wrap(q.db.Scopes(gormScopes...))
 }
@@ -825,15 +846,56 @@ func (q *GormQuery) Unscoped() contracts.Query {
 	return q.wrap(q.db.Unscoped())
 }
 
-// OnlyTrashed 仅查询已软删除的记录（deleted_at != 0）。
+// OnlyTrashed 仅查询已软删除的记录。
+// 软删列两形态并存：框架业务级 int64 deleted_at（0=未删）与 gorm.DeletedAt
+// （NULL=未删）。调用顺序允许 OnlyTrashed 先于 Model（此时无法做类型探测），
+// 故用跨类型 CAST 比较，两种形态同一条件成立：
+//   - int64 列：'0' 仅未删值，非 0 即已删；
+//   - 时间列：NULL 经 CAST 仍为 NULL（被 WHERE 恒假排除），非 NULL 恒 <> '0'。
+//
+// 方言差异：PG 用 TEXT（CAST AS CHAR 会截断为 char(1)），MySQL/SQLite 用 CHAR。
+// 代价：deleted_at 上索引不可用（软删恢复类低频查询可接受）。
 // 注意：列名 "deleted_at" 与 database.SoftDelete.DeletedAt 字段绑定，
 // 若自定义软删除列名需自行实现此逻辑。
 func (q *GormQuery) OnlyTrashed() contracts.Query {
-	return q.wrap(q.db.Unscoped().Where("deleted_at != 0"))
+	castType := "CHAR"
+	if q.db.Dialector.Name() == "postgres" {
+		castType = "TEXT"
+	}
+	return q.wrap(q.db.Unscoped().Where("CAST(deleted_at AS " + castType + ") <> '0'"))
 }
 
 func (q *GormQuery) Restore() error {
+	if q.destDeletedAtTimeBased() {
+		// gorm.DeletedAt 时间列：NULL 即"未删"，写 0 会因类型不兼容报错
+		// （PG 42804 / MySQL 严格模式拒零日期），且不满足 IS NULL 过滤语义。
+		return wrapError(q.db.Unscoped().Update("deleted_at", nil).Error)
+	}
 	return wrapError(q.db.Unscoped().Update("deleted_at", 0).Error)
+}
+
+// destDeletedAtTimeBased 探测链上 Model/Dest 的 DeletedAt 字段是否为
+// gorm.DeletedAt（时间型软删）；无法解析（Table 链/未设模型）时按业务级
+// int64 形态处理。
+func (q *GormQuery) destDeletedAtTimeBased() bool {
+	model := q.db.Statement.Model
+	if model == nil {
+		model = q.db.Statement.Dest
+	}
+	if model == nil {
+		return false
+	}
+	t := reflect.TypeOf(model)
+	for t != nil && (t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array) {
+		t = t.Elem()
+	}
+	if t == nil || t.Kind() != reflect.Struct {
+		return false
+	}
+	if f, ok := t.FieldByName("DeletedAt"); ok {
+		return f.Type == reflect.TypeOf(gorm.DeletedAt{})
+	}
+	return false
 }
 
 func (q *GormQuery) ForceDelete(value any, conds ...any) error {

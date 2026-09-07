@@ -42,6 +42,9 @@ func NewGormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*GormDriv
 	if dsn == "" {
 		return nil, fmt.Errorf("[GoFast] gormdriver driver: unsupported engine %q", cfg.Engine)
 	}
+	if cfg.Engine == "mysql" {
+		dsn = ensureMySQLParseTime(dsn)
+	}
 
 	gormCfg := buildGormConfig(cfg, log)
 
@@ -98,7 +101,9 @@ func NewGormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*GormDriv
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("[GoFast] gormdriver driver: connection failed: %w", err)
+		// 连接失败统一挂 ErrConnFailed 哨兵（ErrConnFailed 文案即 "connection
+		// failed"，错误字符串保持原样不变，仅追加 errors.Is 链，§六 第 12 项）
+		return nil, fmt.Errorf("[GoFast] gormdriver driver: %w: %w", contracts.ErrConnFailed, err)
 	}
 
 	// 配置连接池
@@ -126,6 +131,29 @@ func NewGormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*GormDriv
 	}
 
 	return &GormDriver{db: db, schema: cfg.Schema}, nil
+}
+
+// ensureMySQLParseTime 为 MySQL DSN 补齐时间解析参数（gorm 官方推荐配置）。
+// go-sql-driver 默认将 DATETIME/TIMESTAMP 列返回为 []byte，DSN 缺 parseTime
+// 时时间列 Scan 到 time.Time 会报 unsupported Scan（gorm.DeletedAt 软删等
+// 时间列场景必踩）。已有 parseTime/loc 配置时尊重用户设置不覆盖。
+func ensureMySQLParseTime(dsn string) string {
+	lower := strings.ToLower(dsn)
+	add := make([]string, 0, 2)
+	if !strings.Contains(lower, "parsetime=") {
+		add = append(add, "parseTime=True")
+	}
+	if !strings.Contains(lower, "loc=") {
+		add = append(add, "loc=Local")
+	}
+	if len(add) == 0 {
+		return dsn
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	return dsn + sep + strings.Join(add, "&")
 }
 
 func (d *GormDriver) Query(ctx ...context.Context) contracts.Query {
