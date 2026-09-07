@@ -491,6 +491,35 @@ func applyDefaultValue(gf *gormSchema.Field, fm ormtag.FieldMeta) {
 	case reflect.String:
 		gf.DefaultValueInterface = fm.Default
 	}
+	// 非 scalar 类型（切片/Map 等 json 列载体）DefaultValueInterface 为 nil，
+	// gorm migrator 将 DefaultValue 原文渲染进 DDL——裸 JSON 字面量（如 []、{}）
+	// 会产生非法 SQL（syntax error at or near "["）；补单引号成为合法字符串
+	// 字面量，对齐 xorm 对文本类列 default('[]') 的加引号行为。
+	if gf.DefaultValueInterface == nil && needsQuotedDefault(fm.Default) {
+		gf.DefaultValue = "'" + strings.ReplaceAll(fm.Default, "'", "''") + "'"
+	}
+}
+
+// needsQuotedDefault 判断 default 值是否需要补引号：已是 SQL 字面量形态
+// （数字/引号包裹/函数调用/布尔与 NULL、CURRENT_TIMESTAMP 关键字）不加。
+func needsQuotedDefault(v string) bool {
+	if v == "" {
+		return false
+	}
+	if _, err := strconv.ParseFloat(v, 64); err == nil {
+		return false
+	}
+	if strings.HasPrefix(v, "'") || strings.HasPrefix(v, `"`) {
+		return false
+	}
+	if strings.Contains(v, "(") { // now()、CURRENT_TIMESTAMP(6) 等函数调用
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "true", "false", "null", "current_timestamp":
+		return false
+	}
+	return true
 }
 
 // autoTimeType created/updated 的 gorm 时间类型：time.Time 字段 → UnixTime，
