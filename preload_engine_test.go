@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zhoudm1743/go-fast-framework/contracts"
 )
@@ -70,6 +71,20 @@ type epPhoto struct {
 	OwnerID   string `gorm:"size:16"`
 	OwnerType string `gorm:"size:32"`
 	URL       string `gorm:"size:64"`
+}
+
+// epSoftUser/epSoftOrder 业务级软删模型（int64 deleted_at，0=存活）：共享引擎
+// 子查询须自动附加 deleted_at = 0 过滤（§11.9，双驱动一致）。
+type epSoftUser struct {
+	ID     string        `gorm:"primaryKey;size:16"`
+	Orders []epSoftOrder `gorm:"-" rel:"foreignKey:UserID;references:ID"`
+}
+
+type epSoftOrder struct {
+	ID        string `gorm:"primaryKey;size:16"`
+	UserID    string `gorm:"size:16"`
+	Amount    int
+	DeletedAt int64 `gorm:"column:deleted_at;index;default:0"`
 }
 
 // newPreloadDriver 建 6 张表（原生 2 + 引擎 4）与中间表，种子数据两套一致。
@@ -228,6 +243,38 @@ func TestPreload_DualPath_HasMany(t *testing.T) {
 	want, got := summarizePld(nativeRows), summarizeEp(engineRows)
 	if want != got {
 		t.Errorf("双路径回填应逐项一致:\n原生:\n%s\n引擎:\n%s", want, got)
+	}
+}
+
+// TestPreload_Engine_SoftDeleteFilter 业务级软删（int64 deleted_at）子行不进入
+// 回填结果：不传 conds 共享引擎也须自动附加 deleted_at = 0（§11.9）。
+func TestPreload_Engine_SoftDeleteFilter(t *testing.T) {
+	drv := newTestDriver(t)
+	if err := drv.AutoMigrate(&epSoftUser{}, &epSoftOrder{}); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+	q := drv.Query()
+	for _, o := range []*epSoftOrder{
+		{ID: "so1", UserID: "su1", Amount: 100},
+		{ID: "so4", UserID: "su1", Amount: 999},
+	} {
+		if err := q.Create(o); err != nil {
+			t.Fatalf("Create %s: %v", o.ID, err)
+		}
+	}
+	// 业务级软删标记：so4 置 deleted_at ≠ 0
+	if err := q.Model(&epSoftOrder{}).Where("id = ?", "so4").Update("deleted_at", time.Now().Unix()); err != nil {
+		t.Fatalf("软删 so4: %v", err)
+	}
+	if err := q.Create(&epSoftUser{ID: "su1"}); err != nil {
+		t.Fatalf("Create su1: %v", err)
+	}
+	var users []epSoftUser
+	if err := q.Model(&epSoftUser{}).Where("id = ?", "su1").Preload("Orders").Find(&users); err != nil {
+		t.Fatalf("引擎 Preload: %v", err)
+	}
+	if len(users) != 1 || len(users[0].Orders) != 1 || users[0].Orders[0].ID != "so1" {
+		t.Fatalf("软删子行不应回填（期望仅 [so1]），实际 %+v", users[0].Orders)
 	}
 }
 
