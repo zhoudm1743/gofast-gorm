@@ -48,7 +48,7 @@ database:
 | Having 带参占位符 | 支持（xorm 链上拒绝 ErrUnsupported） | fullcov_chain `Having过滤` |
 | Joins 非法串 | 数据库原始错误（xorm 报 ErrUnsupported） | fullcov_ext `Joins` |
 | Preload contracts 回调 | 仅共享引擎路径（gorm:"-"）支持，原生路径报错 | fullcov_ext `PL-02` |
-| 软删业务级 deleted_at 列 | gorm 不识别（Delete 为物理删，需业务 Update 软删；OnlyTrashed/Restore 已兼容 int64 与 gorm.DeletedAt 双形态） | fullcov_ext `SoftDelete_*` |
+| 软删业务级 deleted_at 列 | gorm 不识别（Delete 为物理删，需业务 Update 软删；OnlyTrashed/Restore 已兼容 int64 与 gorm.DeletedAt 双形态）；打 `sd` 标记升级为框架托管软删（Delete 自动改写置位 UPDATE、默认查询自动过滤，sec/milli/nano/flag/time 五模式，文档 §4.5/§11.9） | fullcov_ext `SoftDelete_*` |
 | 事务终态误用 | sql.ErrTxDone → ErrInvalidTransaction（errors.go 映射） | fullcov_rawtx `Begin_重复Commit与终态后误用` |
 | 超时/连接失败哨兵 | statement_timeout(57014)/max_execution_time(3024) → ErrQueryTimeout；连接失败 → ErrConnFailed | fault_integration_test |
 

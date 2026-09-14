@@ -23,6 +23,11 @@ type GormQuery struct {
 	schema string // 动态 schema 前缀，主要用于 PostgreSQL 多 schema 场景
 	driver *GormDriver
 
+	// unscoped 链上已调用 Unscoped()（框架托管软删的 Delete 改写与
+	// OnlyTrashed/Restore 以它为绕过/限定标记；gorm Statement 上的 Unscoped
+	// 由执行期回调读取，写路径改写需要在构造期确定性读取，故链上另存一份）。
+	unscoped bool
+
 	// enginePreloads 共享 Preload 引擎待执行项（9.3 分流：gorm:"-" 关联字段
 	// 由共享引擎接管；gorm 原生 Preload 无法回填被忽略的关联字段，故延迟到
 	// 终结方法行装载完成后执行）。
@@ -38,10 +43,10 @@ type enginePreloadSpec struct {
 
 var _ contracts.Query = (*GormQuery)(nil)
 
-// wrap 创建新的 GormQuery，传入新的 *gorm.DB，并保留当前 schema、driver 与
-// 待执行的引擎 Preload 列表。
+// wrap 创建新的 GormQuery，传入新的 *gorm.DB，并保留当前 schema、driver、
+// unscoped 标记与待执行的引擎 Preload 列表。
 func (q *GormQuery) wrap(db *gorm.DB) *GormQuery {
-	return &GormQuery{db: db, schema: q.schema, driver: q.driver, enginePreloads: q.enginePreloads}
+	return &GormQuery{db: db, schema: q.schema, driver: q.driver, unscoped: q.unscoped, enginePreloads: q.enginePreloads}
 }
 
 // schemaTable 在 schema 非空且 name 中不含 "." 时自动加上 "schema." 前缀。
@@ -81,7 +86,7 @@ func (q *GormQuery) Schema(name string) contracts.Query {
 	// driver 做 orm tag 懒加载 patch（applySchema → ensurePatched）与共享
 	// Preload 引擎回填；丢失会导致 Schema 链上的写操作按未 patch 的约定
 	// 列名拼 SQL（U18 集成测试回归发现）。
-	return &GormQuery{db: db, schema: name, driver: q.driver, enginePreloads: q.enginePreloads}
+	return &GormQuery{db: db, schema: name, driver: q.driver, unscoped: q.unscoped, enginePreloads: q.enginePreloads}
 }
 
 // GetSchema 返回当前查询上下文的 schema 名称（PostgreSQL 多 schema 场景）。
@@ -587,6 +592,15 @@ func (q *GormQuery) Delete(value any, conds ...any) error {
 	if err != nil {
 		return err
 	}
+	// sd 标记模型：Delete 自动改写为软删除置位 UPDATE（Unscoped 绕过）。
+	if !q.unscoped {
+		if sd, ok := q.driver.sdOfModel(value); ok {
+			if err := wrapError(q.softDelete(db, value, sd, conds...).Error); err != nil {
+				return err
+			}
+			return invokeAfterDelete(q, value)
+		}
+	}
 	if err := wrapError(db.Delete(value, conds...).Error); err != nil {
 		return err
 	}
@@ -682,6 +696,19 @@ func (q *GormQuery) DeleteResult(value any, conds ...any) contracts.Result {
 	db, err := q.applySchema(value)
 	if err != nil {
 		return contracts.Result{Error: err}
+	}
+	// sd 标记模型：Delete 自动改写为软删除置位 UPDATE（Unscoped 绕过）。
+	if !q.unscoped {
+		if sd, ok := q.driver.sdOfModel(value); ok {
+			tx := q.softDelete(db, value, sd, conds...)
+			if tx.Error != nil {
+				return contracts.Result{RowsAffected: tx.RowsAffected, Error: wrapError(tx.Error)}
+			}
+			if err := invokeAfterDelete(q, value); err != nil {
+				return contracts.Result{RowsAffected: tx.RowsAffected, Error: err}
+			}
+			return contracts.Result{RowsAffected: tx.RowsAffected}
+		}
 	}
 	tx := db.Delete(value, conds...)
 	if tx.Error != nil {
@@ -843,12 +870,16 @@ func (q *GormQuery) Lock(mode contracts.LockMode) contracts.Query {
 // ── 软删除扩展 ───────────────────────────────────────────────────
 
 func (q *GormQuery) Unscoped() contracts.Query {
-	return q.wrap(q.db.Unscoped())
+	nq := q.wrap(q.db.Unscoped())
+	nq.unscoped = true
+	return nq
 }
 
 // OnlyTrashed 仅查询已软删除的记录。
-// 软删列两形态并存：框架业务级 int64 deleted_at（0=未删）与 gorm.DeletedAt
-// （NULL=未删）。调用顺序允许 OnlyTrashed 先于 Model（此时无法做类型探测），
+// sd 标记模型（框架托管软删）：按 SdMeta.TrashedCond 类型感知——time 模式
+// IS NOT NULL、flag 模式 = 1、其余整数模式 <> 0。
+// 未标记模型（旧版业务级两形态并存：int64 deleted_at 0=未删 / gorm.DeletedAt
+// NULL=未删）：调用顺序允许 OnlyTrashed 先于 Model（此时无法做类型探测），
 // 故用跨类型 CAST 比较，两种形态同一条件成立：
 //   - int64 列：'0' 仅未删值，非 0 即已删；
 //   - 时间列：NULL 经 CAST 仍为 NULL（被 WHERE 恒假排除），非 NULL 恒 <> '0'。
@@ -858,6 +889,10 @@ func (q *GormQuery) Unscoped() contracts.Query {
 // 注意：列名 "deleted_at" 与 database.SoftDelete.DeletedAt 字段绑定，
 // 若自定义软删除列名需自行实现此逻辑。
 func (q *GormQuery) OnlyTrashed() contracts.Query {
+	if sd, _, ok := q.sdOfChain(); ok {
+		cond, args := sd.Sd.TrashedCond(sd.Column)
+		return q.wrap(q.db.Unscoped().Where(cond, args...))
+	}
 	castType := "CHAR"
 	if q.db.Dialector.Name() == "postgres" {
 		castType = "TEXT"
@@ -866,6 +901,10 @@ func (q *GormQuery) OnlyTrashed() contracts.Query {
 }
 
 func (q *GormQuery) Restore() error {
+	if sd, _, ok := q.sdOfChain(); ok {
+		// sd 模型类型感知恢复：time 模式写 NULL，整数模式写 0。
+		return wrapError(q.db.Unscoped().Update(sd.Column, sd.Sd.AliveValue()).Error)
+	}
 	if q.destDeletedAtTimeBased() {
 		// gorm.DeletedAt 时间列：NULL 即"未删"，写 0 会因类型不兼容报错
 		// （PG 42804 / MySQL 严格模式拒零日期），且不满足 IS NULL 过滤语义。

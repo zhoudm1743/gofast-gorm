@@ -63,7 +63,7 @@ func (d *GormDriver) ensurePatched(model any, db *gorm.DB) error {
 	if _, ok := d.patched.Load(t); ok {
 		return nil
 	}
-	return patchModel(db, t, &d.versionFields)
+	return patchModel(db, t, &d.versionFields, &d.sdFields)
 }
 
 // PatchSchema 将 models 的 orm/ext 统一标签 patch 进 db 连接的 gorm schema 缓存（7.1），
@@ -90,7 +90,7 @@ func PatchSchema(db *gorm.DB, models ...any) error {
 		if _, ok := memo.LoadOrStore(t, struct{}{}); ok {
 			continue
 		}
-		if err := patchModel(db, t, nil); err != nil {
+		if err := patchModel(db, t, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -98,9 +98,10 @@ func PatchSchema(db *gorm.DB, models ...any) error {
 }
 
 // patchModel 对单个模型类型执行 stmt.Parse + orm/ext patch（无去重，调用方负责幂等）。
-// versionRegistry 为 orm:"version" 乐观锁字段注册表（7.4 写路径仿真用）；nil 时跳过
-// 登记（PatchSchema 迁移场景无写路径，无需注册）。
-func patchModel(db *gorm.DB, t reflect.Type, versionRegistry *sync.Map) error {
+// versionRegistry 为 orm:"version" 乐观锁字段注册表（7.4 写路径仿真用）；
+// sdRegistry 为 sd tag 软删字段注册表（§11.9 托管软删用）；nil 时跳过登记
+// （PatchSchema 迁移场景无写路径，无需注册）。
+func patchModel(db *gorm.DB, t reflect.Type, versionRegistry, sdRegistry *sync.Map) error {
 	normalized := reflect.New(t).Interface()
 	stmt := &gorm.Statement{DB: db}
 	if err := stmt.Parse(normalized); err != nil {
@@ -124,7 +125,7 @@ func patchModel(db *gorm.DB, t reflect.Type, versionRegistry *sync.Map) error {
 			gf.Tag = injectGormTag(gf.Tag, frag.fragment)
 		}
 	}
-	return nil
+	return registerSdFields(stmt.Schema, meta, sdRegistry)
 }
 
 // ── applyFieldMeta：orm tag 逐字段 patch（文档 7.1 第一张表） ────────────
@@ -724,6 +725,23 @@ type gormMetaAdapter struct {
 }
 
 var _ preload.MetaAdapter = (*gormMetaAdapter)(nil)
+var _ preload.SoftDeleteCondResolver = (*gormMetaAdapter)(nil)
+
+// SoftDeleteCond sd 模型（框架托管软删）的类型感知存活条件（time 模式
+// IS NULL，整数模式 = 0）；非 sd 模型返回 ok=false，引擎回退 int64 约定。
+func (a *gormMetaAdapter) SoftDeleteCond(modelType reflect.Type) (string, []any, bool) {
+	if a.driver == nil {
+		return "", nil, false
+	}
+	if err := a.driver.ensurePatched(reflect.New(modelType).Interface(), a.db); err != nil {
+		return "", nil, false
+	}
+	if sd, ok := a.driver.sdOfType(modelType); ok {
+		cond, args := sd.Sd.AliveCond(sd.Column)
+		return cond, args, true
+	}
+	return "", nil, false
+}
 
 // schemaOf 解析（并懒加载 patch）模型类型对应的 gorm schema。
 func (a *gormMetaAdapter) schemaOf(t reflect.Type) (*gormSchema.Schema, error) {
@@ -777,6 +795,27 @@ func (a *gormMetaAdapter) HasColumn(modelType reflect.Type, columnName string) b
 		return false
 	}
 	return s.FieldsByDBName[columnName] != nil
+}
+
+// SoftDeleteColumn 业务级软删列（int64 deleted_at 约定，0=存活）的列名；
+// ok=false 表示无业务级软删列——含 gorm 原生 gorm.DeletedAt 时间形态（其
+// IS NULL 过滤由 gorm 自身在类型化 Find 上追加，引擎不重复添加，避免
+// deleted_at = 0 与时间列类型冲突）。
+func (a *gormMetaAdapter) SoftDeleteColumn(modelType reflect.Type) (string, bool) {
+	s, err := a.schemaOf(modelType)
+	if err != nil {
+		return "", false
+	}
+	f := s.FieldsByDBName["deleted_at"]
+	if f == nil {
+		return "", false
+	}
+	switch f.FieldType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return f.DBName, true
+	}
+	return "", false
 }
 
 // ── 通用反射辅助 ─────────────────────────────────────────────────────

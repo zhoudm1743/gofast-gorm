@@ -96,7 +96,11 @@ func newGormConformanceDriver(t *testing.T) contracts.Driver {
 			_ = sqlDB.Close()
 		}
 	})
-	return &conformanceDriver{GormDriver: &GormDriver{db: db}, n: n}
+	d := &GormDriver{db: db}
+	if err := d.registerSoftDeleteCallbacks(); err != nil {
+		t.Fatalf("注册软删回调失败: %v", err)
+	}
+	return &conformanceDriver{GormDriver: d, n: n}
 }
 
 // TestConformance 双驱动共享一致性套件（orm-tag-design.md §11.1）。

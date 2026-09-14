@@ -30,6 +30,7 @@ type GormDriver struct {
 	patched       sync.Map   // reflect.Type → struct{}：已 patch 模型类型
 	patchMu       sync.Mutex // patch 双重检查锁
 	versionFields sync.Map   // reflect.Type → *versionFieldMeta：乐观锁字段注册表
+	sdFields      sync.Map   // reflect.Type → *sdFieldMeta：软删字段注册表（sd tag）
 }
 
 var _ contracts.Driver = (*GormDriver)(nil)
@@ -130,7 +131,13 @@ func NewGormDriver(cfg contracts.ConnectionConfig, log contracts.Log) (*GormDriv
 		return nil, fmt.Errorf("[GoFast] gormdriver driver: register id callback failed: %w", err)
 	}
 
-	return &GormDriver{db: db, schema: cfg.Schema}, nil
+	d := &GormDriver{db: db, schema: cfg.Schema}
+	// 注册框架托管软删除过滤回调（sd tag 模型，文档 §11.9）
+	if err := d.registerSoftDeleteCallbacks(); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+	return d, nil
 }
 
 // ensureMySQLParseTime 为 MySQL DSN 补齐时间解析参数（gorm 官方推荐配置）。
