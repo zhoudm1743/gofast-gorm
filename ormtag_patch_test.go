@@ -485,3 +485,48 @@ func TestOrmTag_DuplicateKey(t *testing.T) {
 		t.Errorf("唯一冲突应映射 ErrDuplicatedKey, 实际: %v", err)
 	}
 }
+
+// ── d.patched 登记钉扎（v1.1.0 concurrent map crash 回归） ─────────────
+
+// 钉扎 v1.1.0 致命并发崩溃修复（energy-sass 队列多 worker 现场复现，详见
+// energy-sass/docs/go-fast-framework-gorm-concurrent-map-crash.md）：
+// ensurePatched 锁结构齐全但成功路径漏 d.patched.Store，d.patched 永为空表，
+// 每条查询都重复 patch 连接级共享 schema（rebuildFieldMaps 边构建边发布），
+// 高并发下 mapassign 撞 mapaccess 触发 "fatal error: concurrent map read and
+// map write"（不可 recover，进程退出码 2）。
+type patchFlagModel struct {
+	ID   uint   `orm:"pk 'id'"`
+	Name string `orm:"'name'"`
+}
+
+// patchFlagBadModel 使用禁用 token，ormtag.Parse 必然失败。
+type patchFlagBadModel struct {
+	ID uint `orm:"pk 'id' cache"`
+}
+
+func TestEnsurePatched_RegistersFlag(t *testing.T) {
+	drv := newTestDriver(t)
+	model := &patchFlagModel{}
+	typ := indirectStructType(model)
+
+	if err := drv.ensurePatched(model, drv.db); err != nil {
+		t.Fatalf("ensurePatched: %v", err)
+	}
+	if _, ok := drv.patched.Load(typ); !ok {
+		t.Fatal("patch 成功后 d.patched 必须登记：漏登记会让每条查询重复 patch " +
+			"连接级共享 schema，并发读写触发 fatal error: concurrent map read and map write")
+	}
+}
+
+func TestEnsurePatched_FailedPatchDoesNotRegister(t *testing.T) {
+	drv := newTestDriver(t)
+	model := &patchFlagBadModel{}
+	typ := indirectStructType(model)
+
+	if err := drv.ensurePatched(model, drv.db); err == nil {
+		t.Fatal("含禁用 token 的模型 patch 应报错")
+	}
+	if _, ok := drv.patched.Load(typ); ok {
+		t.Fatal("失败路径不得登记 d.patched：下一条查询需要自动重试（自恢复）")
+	}
+}

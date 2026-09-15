@@ -63,7 +63,14 @@ func (d *GormDriver) ensurePatched(model any, db *gorm.DB) error {
 	if _, ok := d.patched.Load(t); ok {
 		return nil
 	}
-	return patchModel(db, t, &d.versionFields, &d.sdFields)
+	if err := patchModel(db, t, &d.versionFields, &d.sdFields); err != nil {
+		return err
+	}
+	// 登记成功标记：patchModel 会原地改写连接级共享 schema（rebuildFieldMaps 等），
+	// 漏掉 Store 会导致每条查询重复 patch，读写并发触发
+	// "fatal error: concurrent map read and map write"（schema.FieldsByDBName）。
+	d.patched.Store(t, struct{}{})
+	return nil
 }
 
 // PatchSchema 将 models 的 orm/ext 统一标签 patch 进 db 连接的 gorm schema 缓存（7.1），
@@ -538,25 +545,32 @@ func autoTimeType(gf *gormSchema.Field) gormSchema.TimeType {
 // FieldsByDBName/DBNames/PrimaryFields/PrioritizedPrimaryField/PrimaryFieldDBNames
 // （对齐 gorm schema.Parse 的首见优先语义）。
 func rebuildFieldMaps(s *gormSchema.Schema) {
-	s.FieldsByDBName = make(map[string]*gormSchema.Field, len(s.Fields))
-	s.DBNames = make([]string, 0, len(s.Fields))
-	s.PrimaryFields = nil
+	// 先在局部变量构建完成再一次性发布：schema 为连接级缓存共享实例，
+	// 边构建边赋值会让并发读者读到部分填充的新 map（mapassign 撞 mapaccess，
+	// 触发 "fatal error: concurrent map read and map write"）。
+	fieldsByDBName := make(map[string]*gormSchema.Field, len(s.Fields))
+	dbNames := make([]string, 0, len(s.Fields))
+	var primaryFields []*gormSchema.Field
 	for _, f := range s.Fields {
 		if f.DBName == "" {
 			continue
 		}
-		if _, ok := s.FieldsByDBName[f.DBName]; !ok {
-			s.FieldsByDBName[f.DBName] = f
-			s.DBNames = append(s.DBNames, f.DBName)
+		if _, ok := fieldsByDBName[f.DBName]; !ok {
+			fieldsByDBName[f.DBName] = f
+			dbNames = append(dbNames, f.DBName)
 		}
 		if f.PrimaryKey {
-			s.PrimaryFields = append(s.PrimaryFields, f)
+			primaryFields = append(primaryFields, f)
 		}
 	}
-	s.PrimaryFieldDBNames = nil
-	for _, f := range s.PrimaryFields {
-		s.PrimaryFieldDBNames = append(s.PrimaryFieldDBNames, f.DBName)
+	var primaryFieldDBNames []string
+	for _, f := range primaryFields {
+		primaryFieldDBNames = append(primaryFieldDBNames, f.DBName)
 	}
+	s.FieldsByDBName = fieldsByDBName
+	s.DBNames = dbNames
+	s.PrimaryFields = primaryFields
+	s.PrimaryFieldDBNames = primaryFieldDBNames
 	s.PrioritizedPrimaryField = nil
 	switch len(s.PrimaryFields) {
 	case 1:
